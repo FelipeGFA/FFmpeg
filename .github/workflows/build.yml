@@ -30,7 +30,7 @@ jobs:
         include:
           - os: ubuntu-24.04
             rid: linux-x64
-          - os: macos-15-intel
+          - os: macos-latest
             rid: osx-x64
     runs-on: ${{ matrix.os }}
     steps:
@@ -45,7 +45,9 @@ jobs:
 
       - name: Install macOS build tools
         if: matrix.rid == 'osx-x64'
-        run: brew install nasm pkg-config
+        run: |
+          brew untap aws/tap || true
+          brew install nasm
 
       - name: Build FFmpeg
         run: bash scripts/build-sharpemu-ffmpeg.sh "$PWD/artifacts/install"
@@ -56,22 +58,21 @@ jobs:
           "$binary" -hide_banner -version
           "$binary" -hide_banner -protocols | grep -Eq '^[[:space:]]+pipe$'
 
-      - name: Package binary
+      - name: Stage binary
         env:
           RID: ${{ matrix.rid }}
         run: |
-          package="sharpemu-ffmpeg-${RID}"
-          mkdir -p "artifacts/package/${package}"
-          cp artifacts/install/bin/ffmpeg "artifacts/package/${package}/ffmpeg"
-          cp LICENSE.md COPYING.LGPLv2.1 "artifacts/package/${package}/"
-          git rev-parse HEAD > "artifacts/package/${package}/SOURCE_COMMIT.txt"
-          tar -czf "artifacts/${package}.tar.gz" -C artifacts/package "${package}"
+          package_dir="artifacts/package/sharpemu-ffmpeg-${RID}"
+          mkdir -p "${package_dir}"
+          cp artifacts/install/bin/ffmpeg "${package_dir}/ffmpeg"
+          cp LICENSE.md COPYING.LGPLv2.1 "${package_dir}/"
+          git rev-parse HEAD > "${package_dir}/SOURCE_COMMIT.txt"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
           name: sharpemu-ffmpeg-${{ matrix.rid }}
-          path: artifacts/sharpemu-ffmpeg-${{ matrix.rid }}.tar.gz
+          path: artifacts/package/sharpemu-ffmpeg-${{ matrix.rid }}/*
           if-no-files-found: error
 
   build-windows:
@@ -105,22 +106,20 @@ jobs:
           "$binary" -hide_banner -version
           "$binary" -hide_banner -protocols | grep -Eq '^[[:space:]]+pipe$'
 
-      - name: Package binary
+      - name: Stage binary
         shell: pwsh
         run: |
-          $package = "sharpemu-ffmpeg-win-x64"
-          $packageDir = Join-Path "artifacts/package" $package
+          $packageDir = "artifacts/package/sharpemu-ffmpeg-win-x64"
           New-Item -ItemType Directory -Path $packageDir -Force | Out-Null
-          Copy-Item "artifacts/install/bin/ffmpeg.exe" $packageDir
+          Copy-Item "artifacts/install/bin/ffmpeg.exe" "$packageDir/ffmpeg.exe"
           Copy-Item "LICENSE.md", "COPYING.LGPLv2.1" $packageDir
-          git rev-parse HEAD | Set-Content (Join-Path $packageDir "SOURCE_COMMIT.txt")
-          Compress-Archive -Path $packageDir -DestinationPath "artifacts/$package.zip"
+          git rev-parse HEAD | Set-Content "$packageDir/SOURCE_COMMIT.txt"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
           name: sharpemu-ffmpeg-win-x64
-          path: artifacts/sharpemu-ffmpeg-win-x64.zip
+          path: artifacts/package/sharpemu-ffmpeg-win-x64/*
           if-no-files-found: error
 
   release:
@@ -143,7 +142,12 @@ jobs:
           GH_REPO: ${{ github.repository }}
           GH_TOKEN: ${{ github.token }}
         run: |
-          mapfile -t assets < <(find release -type f \( -name '*.zip' -o -name '*.tar.gz' \) | sort)
+          mkdir -p release-assets
+          for package_dir in release/sharpemu-ffmpeg-*; do
+            package="$(basename "${package_dir}")"
+            (cd "${package_dir}" && zip -q -r "../../release-assets/${package}.zip" .)
+          done
+          mapfile -t assets < <(find release-assets -maxdepth 1 -type f -name 'sharpemu-ffmpeg-*.zip' | sort)
           if [ "${#assets[@]}" -ne 3 ]; then
             echo "Expected 3 release assets, found ${#assets[@]}." >&2
             exit 1
