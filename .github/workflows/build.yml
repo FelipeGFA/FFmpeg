@@ -1,0 +1,154 @@
+# Copyright (C) 2026 SharpEmu Emulator Project
+# SPDX-License-Identifier: LGPL-2.1-or-later
+
+name: Build binaries
+
+on:
+  push:
+    branches:
+      - master
+    tags:
+      - "v*"
+  pull_request:
+    branches:
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ffmpeg-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'push' || github.ref_type != 'tag' }}
+
+jobs:
+  build-unix:
+    name: Build ${{ matrix.rid }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            rid: linux-x64
+          - os: macos-15-intel
+            rid: osx-x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install Linux build tools
+        if: matrix.rid == 'linux-x64'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes build-essential nasm pkg-config
+
+      - name: Install macOS build tools
+        if: matrix.rid == 'osx-x64'
+        run: brew install nasm pkg-config
+
+      - name: Build FFmpeg
+        run: bash scripts/build-sharpemu-ffmpeg.sh "$PWD/artifacts/install"
+
+      - name: Validate binary
+        run: |
+          binary="$PWD/artifacts/install/bin/ffmpeg"
+          "$binary" -hide_banner -version
+          "$binary" -hide_banner -protocols | grep -Eq '^[[:space:]]+pipe$'
+
+      - name: Package binary
+        env:
+          RID: ${{ matrix.rid }}
+        run: |
+          package="sharpemu-ffmpeg-${RID}"
+          mkdir -p "artifacts/package/${package}"
+          cp artifacts/install/bin/ffmpeg "artifacts/package/${package}/ffmpeg"
+          cp LICENSE.md COPYING.LGPLv2.1 "artifacts/package/${package}/"
+          git rev-parse HEAD > "artifacts/package/${package}/SOURCE_COMMIT.txt"
+          tar -czf "artifacts/${package}.tar.gz" -C artifacts/package "${package}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: sharpemu-ffmpeg-${{ matrix.rid }}
+          path: artifacts/sharpemu-ffmpeg-${{ matrix.rid }}.tar.gz
+          if-no-files-found: error
+
+  build-windows:
+    name: Build win-x64
+    runs-on: windows-2025
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          cache: true
+          install: >-
+            make
+            diffutils
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-nasm
+            mingw-w64-ucrt-x86_64-pkgconf
+
+      - name: Build FFmpeg
+        shell: msys2 {0}
+        run: bash scripts/build-sharpemu-ffmpeg.sh "$PWD/artifacts/install"
+
+      - name: Validate binary
+        shell: msys2 {0}
+        run: |
+          binary="$PWD/artifacts/install/bin/ffmpeg.exe"
+          "$binary" -hide_banner -version
+          "$binary" -hide_banner -protocols | grep -Eq '^[[:space:]]+pipe$'
+
+      - name: Package binary
+        shell: pwsh
+        run: |
+          $package = "sharpemu-ffmpeg-win-x64"
+          $packageDir = Join-Path "artifacts/package" $package
+          New-Item -ItemType Directory -Path $packageDir -Force | Out-Null
+          Copy-Item "artifacts/install/bin/ffmpeg.exe" $packageDir
+          Copy-Item "LICENSE.md", "COPYING.LGPLv2.1" $packageDir
+          git rev-parse HEAD | Set-Content (Join-Path $packageDir "SOURCE_COMMIT.txt")
+          Compress-Archive -Path $packageDir -DestinationPath "artifacts/$package.zip"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: sharpemu-ffmpeg-win-x64
+          path: artifacts/sharpemu-ffmpeg-win-x64.zip
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - build-unix
+      - build-windows
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: release
+
+      - name: Create GitHub release
+        env:
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mapfile -t assets < <(find release -type f \( -name '*.zip' -o -name '*.tar.gz' \) | sort)
+          if [ "${#assets[@]}" -ne 3 ]; then
+            echo "Expected 3 release assets, found ${#assets[@]}." >&2
+            exit 1
+          fi
+          gh release create "${GITHUB_REF_NAME}" "${assets[@]}" \
+            --verify-tag \
+            --title "SharpEmu FFmpeg ${GITHUB_REF_NAME}" \
+            --generate-notes
