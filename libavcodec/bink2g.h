@@ -590,13 +590,16 @@ static void bink2g_decode_dc(Bink2Context *c, GetBitContext *gb, int *dc,
 
 static int bink2g_decode_ac(GetBitContext *gb, const uint8_t scan[64],
                             int16_t block[4][64], unsigned cbp,
-                            int q, const uint16_t qmat[4][64])
+                            int q, const uint16_t qmat[4][64],
+                            uint8_t ac_count[4])
 {
     int idx, next, val, skip;
     VLC *skip_vlc;
 
-    for (int i = 0; i < 4; i++)
+    for (int i = 0; i < 4; i++) {
         memset(block[i], 0, sizeof(int16_t) * 64);
+        ac_count[i] = 0;
+    }
 
     if ((cbp & 0xf) == 0)
         return 0;
@@ -632,11 +635,19 @@ static int bink2g_decode_ac(GetBitContext *gb, const uint8_t scan[64],
             if (get_bits1(gb))
                 val = -val;
             block[i][scan[idx]] = ((val * qmat[q & 3][scan[idx]] * (1 << (q >> 2))) + 64) >> 7;
+            ac_count[i]++;
             idx++;
         }
     }
 
     return 0;
+}
+
+static inline uint16_t bink2g_block_state(int dc, unsigned ac_count, int intra)
+{
+    const unsigned strength = (ac_count < 8) + (ac_count < 4) + !ac_count;
+
+    return (dc & 0x1FFF) | (strength << 13) | (intra ? 0x8000 : 0);
 }
 
 static int bink2g_decode_intra_luma(Bink2Context *c,
@@ -646,6 +657,7 @@ static int bink2g_decode_intra_luma(Bink2Context *c,
                                     int flags)
 {
     int *dc = c->current_idc[c->mb_pos].dc[c->comp];
+    uint16_t *state = c->current_idc[c->mb_pos].state[c->comp];
     unsigned cbp;
     int ret;
 
@@ -654,15 +666,21 @@ static int bink2g_decode_intra_luma(Bink2Context *c,
     bink2g_decode_dc(c, gb, dc, 1, q, 0, 2047, flags);
 
     for (int i = 0; i < 4; i++) {
+        uint8_t ac_count[4];
+
         ret = bink2g_decode_ac(gb, bink2g_scan, block, cbp >> (4*i),
-                               q, bink2g_luma_intra_qmat);
+                               q, bink2g_luma_intra_qmat, ac_count);
         if (ret < 0)
             return ret;
 
         for (int j = 0; j < 4; j++) {
-            block[j][0] = dc[i * 4 + j] * 8 + 32;
-            bink2g_idct_put(dst + (luma_repos[i * 4 + j] & 3) * 8 +
-                            (luma_repos[i * 4 + j] >> 2) * 8 * stride, stride, block[j]);
+            const int block_index = i * 4 + j;
+            const int raster_index = luma_repos[block_index];
+
+            state[raster_index] = bink2g_block_state(dc[block_index], ac_count[j], 1);
+            block[j][0] = dc[block_index] * 8 + 32;
+            bink2g_idct_put(dst + (raster_index & 3) * 8 +
+                            (raster_index >> 2) * 8 * stride, stride, block[j]);
         }
     }
 
@@ -676,6 +694,8 @@ static int bink2g_decode_intra_chroma(Bink2Context *c,
                                       int flags)
 {
     int *dc = c->current_idc[c->mb_pos].dc[c->comp];
+    uint16_t *state = c->current_idc[c->mb_pos].state[c->comp];
+    uint8_t ac_count[4];
     unsigned cbp;
     int ret;
 
@@ -684,11 +704,12 @@ static int bink2g_decode_intra_chroma(Bink2Context *c,
     bink2g_decode_dc(c, gb, dc, 0, q, 0, 2047, flags);
 
     ret = bink2g_decode_ac(gb, bink2g_scan, block, cbp,
-                           q, bink2g_chroma_intra_qmat);
+                           q, bink2g_chroma_intra_qmat, ac_count);
     if (ret < 0)
         return ret;
 
     for (int j = 0; j < 4; j++) {
+        state[j] = bink2g_block_state(dc[j], ac_count[j], 1);
         block[j][0] = dc[j] * 8 + 32;
         bink2g_idct_put(dst + (j & 1) * 8 +
                         (j >> 1) * 8 * stride, stride, block[j]);
@@ -704,23 +725,31 @@ static int bink2g_decode_inter_luma(Bink2Context *c,
                                     int flags)
 {
     int *dc = c->current_idc[c->mb_pos].dc[c->comp];
+    uint16_t *state = c->current_idc[c->mb_pos].state[c->comp];
+    const int maxdc = c->frame_flags & 0x40000 ? 2047 : 1023;
     unsigned cbp;
     int ret;
 
     *prev_cbp = cbp = bink2g_decode_cbp_luma(c, gb, *prev_cbp);
 
-    bink2g_decode_dc(c, gb, dc, 1, q, -1023, 1023, 0xA8);
+    bink2g_decode_dc(c, gb, dc, 1, q, -maxdc, maxdc, 0xA8);
 
     for (int i = 0; i < 4; i++) {
+        uint8_t ac_count[4];
+
         ret = bink2g_decode_ac(gb, bink2g_scan, block, cbp >> (4 * i),
-                               q, bink2g_inter_qmat);
+                               q, bink2g_inter_qmat, ac_count);
         if (ret < 0)
             return ret;
 
         for (int j = 0; j < 4; j++) {
-            block[j][0] = dc[i * 4 + j] * 8 + 32;
-            bink2g_idct_add(dst + (luma_repos[i * 4 + j] & 3) * 8 +
-                            (luma_repos[i * 4 + j] >> 2) * 8 * stride,
+            const int block_index = i * 4 + j;
+            const int raster_index = luma_repos[block_index];
+
+            state[raster_index] = bink2g_block_state(dc[block_index], ac_count[j], 0);
+            block[j][0] = dc[block_index] * 8 + 32;
+            bink2g_idct_add(dst + (raster_index & 3) * 8 +
+                            (raster_index >> 2) * 8 * stride,
                             stride, block[j]);
         }
     }
@@ -735,19 +764,23 @@ static int bink2g_decode_inter_chroma(Bink2Context *c,
                                       int flags)
 {
     int *dc = c->current_idc[c->mb_pos].dc[c->comp];
+    uint16_t *state = c->current_idc[c->mb_pos].state[c->comp];
+    uint8_t ac_count[4];
+    const int maxdc = c->frame_flags & 0x40000 ? 2047 : 1023;
     unsigned cbp;
     int ret;
 
     *prev_cbp = cbp = bink2g_decode_cbp_chroma(gb, *prev_cbp);
 
-    bink2g_decode_dc(c, gb, dc, 0, q, -1023, 1023, 0xA8);
+    bink2g_decode_dc(c, gb, dc, 0, q, -maxdc, maxdc, 0xA8);
 
     ret = bink2g_decode_ac(gb, bink2g_scan, block, cbp,
-                           q, bink2g_inter_qmat);
+                           q, bink2g_inter_qmat, ac_count);
     if (ret < 0)
         return ret;
 
     for (int j = 0; j < 4; j++) {
+        state[j] = bink2g_block_state(dc[j], ac_count[j], 0);
         block[j][0] = dc[j] * 8 + 32;
         bink2g_idct_add(dst + (j & 1) * 8 +
                         (j >> 1) * 8 * stride, stride, block[j]);
@@ -822,12 +855,14 @@ static void bink2g_predict_mv(Bink2Context *c, int x, int y, int flags, MVectors
             c_mv->v[3][0] = mv.v[3][0] + mid_pred(c_mv->v[0][0], c_mv->v[1][0], c_mv->v[2][0]);
             c_mv->v[3][1] = mv.v[3][1] + mid_pred(c_mv->v[0][1], c_mv->v[1][1], c_mv->v[2][1]);
         } else {
+            const int left_v1 = mv.nb_vectors == 0 ? 3 : 1;
+
             c_mv->v[0][0] = mv.v[0][0] + mid_pred(l_mv->v[0][0], l_mv->v[1][0], l_mv->v[3][0]);
             c_mv->v[0][1] = mv.v[0][1] + mid_pred(l_mv->v[0][1], l_mv->v[1][1], l_mv->v[3][1]);
             c_mv->v[2][0] = mv.v[2][0] + mid_pred(l_mv->v[1][0], l_mv->v[3][0], c_mv->v[0][0]);
             c_mv->v[2][1] = mv.v[2][1] + mid_pred(l_mv->v[1][1], l_mv->v[3][1], c_mv->v[0][1]);
-            c_mv->v[1][0] = mv.v[1][0] + mid_pred(l_mv->v[1][0], c_mv->v[0][0], c_mv->v[2][0]);
-            c_mv->v[1][1] = mv.v[1][1] + mid_pred(l_mv->v[1][1], c_mv->v[0][1], c_mv->v[2][1]);
+            c_mv->v[1][0] = mv.v[1][0] + mid_pred(l_mv->v[left_v1][0], c_mv->v[0][0], c_mv->v[2][0]);
+            c_mv->v[1][1] = mv.v[1][1] + mid_pred(l_mv->v[left_v1][1], c_mv->v[0][1], c_mv->v[2][1]);
             c_mv->v[3][0] = mv.v[3][0] + mid_pred(c_mv->v[0][0], c_mv->v[1][0], c_mv->v[2][0]);
             c_mv->v[3][1] = mv.v[3][1] + mid_pred(c_mv->v[0][1], c_mv->v[1][1], c_mv->v[2][1]);
         }
@@ -892,13 +927,14 @@ static void update_inter_q(Bink2Context *c, int8_t *inter_q, int dq, int flags)
                             c->prev_q[c->mb_pos - 1].inter_q) + dq;
 }
 
-#define CH1FILTER(src)    ((6*(src)[0] + 2*(src)[1] + 4) >> 3)
-#define CH2FILTER(src)    ((  (src)[0] +   (src)[1] + 1) >> 1)
-#define CH3FILTER(src)    ((2*(src)[0] + 6*(src)[1] + 4) >> 3)
+static const uint8_t bink2g_chroma_weights[4][2] = {
+    { 1, 0 },
+    { 3, 1 },
+    { 1, 1 },
+    { 1, 3 },
+};
 
-#define CV1FILTER(src, i)    ((6*(src)[0] + 2*(src)[i] + 4) >> 3)
-#define CV2FILTER(src, i)    ((  (src)[0] +   (src)[i] + 1) >> 1)
-#define CV3FILTER(src, i)    ((2*(src)[0] + 6*(src)[i] + 4) >> 3)
+static const uint8_t bink2g_chroma_shifts[4] = { 0, 2, 1, 2 };
 
 static void bink2g_c_mc(Bink2Context *c, int x, int y,
                         uint8_t *dst, int stride,
@@ -907,8 +943,8 @@ static void bink2g_c_mc(Bink2Context *c, int x, int y,
                         int mv_x, int mv_y,
                         int mode)
 {
-    uint8_t *msrc;
-    uint8_t temp[8*9];
+    const uint8_t *msrc;
+    int hphase, vphase, shift, rounding;
 
     if (mv_x < 0 || mv_x >= width ||
         mv_y < 0 || mv_y >= height)
@@ -916,166 +952,83 @@ static void bink2g_c_mc(Bink2Context *c, int x, int y,
 
     msrc = src + mv_x + mv_y * sstride;
 
-    switch (mode) {
-    case 0:
+    if (mode == 0) {
         copy_block8(dst, msrc, stride, sstride, 8);
-        break;
-    case 1:
-        for (int j = 0; j < 8; j++) {
-            for (int i = 0; i < 8; i++)
-                dst[i] = av_clip_uint8(CH1FILTER(msrc + i));
-            dst  += stride;
-            msrc += sstride;
+        return;
+    }
+
+    hphase = mode & 3;
+    vphase = mode >> 2;
+    shift = bink2g_chroma_shifts[hphase] + bink2g_chroma_shifts[vphase];
+    rounding = 1 << (shift - 1);
+
+    for (int y = 0; y < 8; y++) {
+        const uint8_t *top = msrc + y * sstride;
+        const uint8_t *bottom = top + (vphase != 0) * sstride;
+
+        for (int x = 0; x < 8; x++) {
+            const int top_value = bink2g_chroma_weights[hphase][0] * top[x] +
+                                  bink2g_chroma_weights[hphase][1] * top[x + (hphase != 0)];
+            const int bottom_value = bink2g_chroma_weights[hphase][0] * bottom[x] +
+                                     bink2g_chroma_weights[hphase][1] * bottom[x + (hphase != 0)];
+            const int value = bink2g_chroma_weights[vphase][0] * top_value +
+                              bink2g_chroma_weights[vphase][1] * bottom_value;
+
+            dst[x] = (value + rounding) >> shift;
         }
-        break;
-    case 2:
-        for (int j = 0; j < 8; j++) {
-            for (int i = 0; i < 8; i++)
-                dst[i] = av_clip_uint8(CH2FILTER(msrc + i));
-            dst  += stride;
-            msrc += sstride;
-        }
-        break;
-    case 3:
-        for (int j = 0; j < 8; j++) {
-            for (int i = 0; i < 8; i++)
-                dst[i] = av_clip_uint8(CH3FILTER(msrc + i));
-            dst  += stride;
-            msrc += sstride;
-        }
-        break;
-    case 4:
-        for (int j = 0; j < 8; j++) {
-            for (int i = 0; i < 8; i++)
-                dst[i*stride] = av_clip_uint8(CV1FILTER(msrc + i*sstride, sstride));
-            dst  += 1;
-            msrc += 1;
-        }
-        break;
-    case 5:
-        for (int i = 0; i < 9; i++) {
-            for (int j = 0; j < 8; j++)
-                temp[i*8+j] = av_clip_uint8(CH1FILTER(msrc + j));
-            msrc += sstride;
-        }
-        for (int j = 0; j < 8; j++) {
-            for (int i = 0; i < 8; i++)
-                dst[i] = av_clip_uint8(CV1FILTER(temp+j*8+i, 8));
-            dst  += stride;
-        }
-        break;
-    case 6:
-        for (int i = 0; i < 9; i++) {
-            for (int j = 0; j < 8; j++)
-                temp[i*8+j] = av_clip_uint8(CH2FILTER(msrc + j));
-            msrc += sstride;
-        }
-        for (int j = 0; j < 8; j++) {
-            for (int i = 0; i < 8; i++)
-                dst[i] = av_clip_uint8(CV1FILTER(temp+j*8+i, 8));
-            dst  += stride;
-        }
-        break;
-    case 7:
-        for (int i = 0; i < 9; i++) {
-            for (int j = 0; j < 8; j++)
-                temp[i*8+j] = av_clip_uint8(CH3FILTER(msrc + j));
-            msrc += sstride;
-        }
-        for (int j = 0; j < 8; j++) {
-            for (int i = 0; i < 8; i++)
-                dst[i] = av_clip_uint8(CV1FILTER(temp+j*8+i, 8));
-            dst  += stride;
-        }
-        break;
-    case 8:
-        for (int j = 0; j < 8; j++) {
-            for (int i = 0; i < 8; i++)
-                dst[i*stride] = av_clip_uint8(CV2FILTER(msrc + i*sstride, sstride));
-            dst  += 1;
-            msrc += 1;
-        }
-        break;
-    case 9:
-        for (int i = 0; i < 9; i++) {
-            for (int j = 0; j < 8; j++)
-                temp[i*8+j] = av_clip_uint8(CH1FILTER(msrc + j));
-            msrc += sstride;
-        }
-        for (int j = 0; j < 8; j++) {
-            for (int i = 0; i < 8; i++)
-                dst[i] = av_clip_uint8(CV2FILTER(temp+j*8+i, 8));
-            dst  += stride;
-        }
-        break;
-    case 10:
-        for (int i = 0; i < 9; i++) {
-            for (int j = 0; j < 8; j++)
-                temp[i*8+j] = av_clip_uint8(CH2FILTER(msrc + j));
-            msrc += sstride;
-        }
-        for (int j = 0; j < 8; j++) {
-            for (int i = 0; i < 8; i++)
-                dst[i] = av_clip_uint8(CV2FILTER(temp+j*8+i, 8));
-            dst  += stride;
-        }
-        break;
-    case 11:
-        for (int i = 0; i < 9; i++) {
-            for (int j = 0; j < 8; j++)
-                temp[i*8+j] = av_clip_uint8(CH3FILTER(msrc + j));
-            msrc += sstride;
-        }
-        for (int j = 0; j < 8; j++) {
-            for (int i = 0; i < 8; i++)
-                dst[i] = av_clip_uint8(CV2FILTER(temp+j*8+i, 8));
-            dst  += stride;
-        }
-        break;
-    case 12:
-        for (int j = 0; j < 8; j++) {
-            for (int i = 0; i < 8; i++)
-                dst[i*stride] = av_clip_uint8(CV3FILTER(msrc + i*sstride, sstride));
-            dst  += 1;
-            msrc += 1;
-        }
-        break;
-    case 13:
-        for (int i = 0; i < 9; i++) {
-            for (int j = 0; j < 8; j++)
-                temp[i*8+j] = av_clip_uint8(CH1FILTER(msrc + j));
-            msrc += sstride;
-        }
-        for (int j = 0; j < 8; j++) {
-            for (int i = 0; i < 8; i++)
-                dst[i] = av_clip_uint8(CV3FILTER(temp+j*8+i, 8));
-            dst  += stride;
-        }
-        break;
-    case 14:
-        for (int i = 0; i < 9; i++) {
-            for (int j = 0; j < 8; j++)
-                temp[i*8+j] = av_clip_uint8(CH2FILTER(msrc + j));
-            msrc += sstride;
-        }
-        for (int j = 0; j < 8; j++) {
-            for (int i = 0; i < 8; i++)
-                dst[i] = av_clip_uint8(CV3FILTER(temp+j*8+i, 8));
-            dst  += stride;
-        }
-        break;
-    case 15:
-        for (int i = 0; i < 9; i++) {
-            for (int j = 0; j < 8; j++)
-                temp[i*8+j] = av_clip_uint8(CH3FILTER(msrc + j));
-            msrc += sstride;
-        }
-        for (int j = 0; j < 8; j++) {
-            for (int i = 0; i < 8; i++)
-                dst[i] = av_clip_uint8(CV3FILTER(temp+j*8+i, 8));
-            dst  += stride;
-        }
-        break;
+        dst += stride;
+    }
+}
+
+static void bink2g_filter_vertical_edge(uint8_t *p, int stride,
+                                        unsigned left, unsigned right)
+{
+    const unsigned index = left | (right << 2);
+
+    if (!index || index == 15)
+        return;
+
+    for (int y = 0; y < 8; y++, p += stride) {
+        const int b = p[-1];
+        const int c = p[0];
+        const int delta = c - b;
+        const int outer = (2 * delta + 8) >> 4;
+        const int inner = (4 * delta + 8) >> 4;
+
+        if (left >= 2)
+            p[-2] = av_clip_uint8(p[-2] + outer);
+        if (left >= 1)
+            p[-1] = av_clip_uint8(b + inner);
+        if (right >= 1)
+            p[0] = av_clip_uint8(c - inner);
+        if (right >= 2)
+            p[1] = av_clip_uint8(p[1] - outer);
+    }
+}
+
+static void bink2g_filter_horizontal_edge(uint8_t *p, int stride,
+                                          unsigned top, unsigned bottom)
+{
+    const unsigned index = top | (bottom << 2);
+
+    if (!index || index == 15)
+        return;
+
+    for (int x = 0; x < 8; x++, p++) {
+        const int b = p[-stride];
+        const int c = p[0];
+        const int delta = c - b;
+        const int outer = (2 * delta + 8) >> 4;
+        const int inner = (4 * delta + 8) >> 4;
+
+        if (top >= 2)
+            p[-2 * stride] = av_clip_uint8(p[-2 * stride] + outer);
+        if (top >= 1)
+            p[-stride] = av_clip_uint8(b + inner);
+        if (bottom >= 1)
+            p[0] = av_clip_uint8(c - inner);
+        if (bottom >= 2)
+            p[stride] = av_clip_uint8(p[stride] - outer);
     }
 }
 
@@ -1145,12 +1098,12 @@ static void bink2g_y_mc(Bink2Context *c, int x, int y,
             msrc += 1;
         }
     } else if (mode == 3) {
-        uint8_t temp[21 * 16];
+        int16_t temp[21 * 16];
 
         msrc -= 2 * sstride;
         for (int i = 0; i < 21; i++) {
             for (int j = 0; j < 16; j++)
-                temp[i*16+j] = av_clip_uint8(LHFILTER(msrc + j));
+                temp[i*16+j] = LHFILTER(msrc + j);
             msrc += sstride;
         }
         for (int j = 0; j < 16; j++) {
@@ -1237,6 +1190,425 @@ static void bink2g_average_luma(Bink2Context *c, int x, int y,
     }
 }
 
+static inline unsigned bink2g_filter_strength(uint16_t state)
+{
+    return (state >> 13) & 3;
+}
+
+static inline int bink2g_filter_map_skip(const uint8_t *map, int position)
+{
+    const unsigned bit = position >> 3;
+
+    return (map[bit >> 3] >> (bit & 7)) & 1;
+}
+
+static inline int bink2g_mv_discontinuity(const MVectors *a, int ai,
+                                          const MVectors *b, int bi)
+{
+    return FFABS(a->v[ai][0] - b->v[bi][0]) > 1 ||
+           FFABS(a->v[ai][1] - b->v[bi][1]) > 1;
+}
+
+static inline void bink2g_force_mv_edge(const MVectors *a, int ai,
+                                        const MVectors *b, int bi,
+                                        uint16_t left_state,
+                                        uint16_t right_state,
+                                        unsigned *left, unsigned *right)
+{
+    if (!(left_state & 0x8000) && !(right_state & 0x8000) &&
+        bink2g_mv_discontinuity(a, ai, b, bi))
+        *left = *right = 2;
+}
+
+static inline void bink2g_select_coding_edge(uint16_t left_state,
+                                             uint16_t right_state,
+                                             unsigned *left,
+                                             unsigned *right)
+{
+    const int left_intra  = !!(left_state  & 0x8000);
+    const int right_intra = !!(right_state & 0x8000);
+
+    if (!left_intra)
+        *left = 0;
+    if (!right_intra)
+        *right = 0;
+}
+
+static inline int bink2g_recon_near(uint16_t a, uint16_t b, int threshold)
+{
+    const int16_t ab = (int16_t)(uint16_t)(a - b);
+    const int16_t ba = (int16_t)(uint16_t)(b - a);
+
+    return FFMAX(ab, ba) < threshold;
+}
+
+static inline int bink2g_recon_mulhi(int k, int v)
+{
+    return ((int32_t)(int16_t)k * (int16_t)v) >> 16;
+}
+
+static inline int bink2g_recon_curve(int base, int left, int right, int pos)
+{
+    switch (pos) {
+    case 0: return base + bink2g_recon_mulhi(26624, left);
+    case 1: return base + bink2g_recon_mulhi(18432, left) + (right >> 7);
+    case 2: return base + bink2g_recon_mulhi(12288, left) + (right >> 5);
+    case 3: return base + bink2g_recon_mulhi( 7168, left) + (right >> 4);
+    case 4: return base + bink2g_recon_mulhi( 7168, right) + (left >> 4);
+    case 5: return base + bink2g_recon_mulhi(12288, right) + (left >> 5);
+    case 6: return base + bink2g_recon_mulhi(18432, right) + (left >> 7);
+    default:return base + bink2g_recon_mulhi(26624, right);
+    }
+}
+
+static inline uint16_t bink2g_recon_state(const DCIPredict *row, int comp,
+                                          int blocks_per_mb, int blocks_w,
+                                          int block_x, int block_y)
+{
+    block_x = av_clip(block_x, 0, blocks_w - 1);
+    return row[block_x / blocks_per_mb].state[comp]
+              [block_y * blocks_per_mb + block_x % blocks_per_mb];
+}
+
+static void bink2g_reconstruct_block(uint8_t *dst, int stride,
+                                     int width, int height,
+                                     uint16_t left, uint16_t target,
+                                     uint16_t right, uint16_t up_left,
+                                     uint16_t up, uint16_t up_right,
+                                     uint16_t down_left, uint16_t down,
+                                     uint16_t down_right, int threshold)
+{
+    int center[8], top[8], bottom[8];
+    int d, l, r, u, v, ul, ur, dl, dr;
+
+    if (target < 0xE000 || width <= 0 || height <= 0)
+        return;
+
+    d  = target & 0x1FFF;
+    l  = bink2g_recon_near(target, left,       threshold) ? left       & 0x1FFF : d;
+    r  = bink2g_recon_near(target, right,      threshold) ? right      & 0x1FFF : d;
+    u  = bink2g_recon_near(target, up,         threshold) ? up         & 0x1FFF : d;
+    v  = bink2g_recon_near(target, down,       threshold) ? down       & 0x1FFF : d;
+    ul = bink2g_recon_near(target, up_left,    threshold) ? up_left    & 0x1FFF : l;
+    ur = bink2g_recon_near(target, up_right,   threshold) ? up_right   & 0x1FFF : r;
+    dl = bink2g_recon_near(target, down_left,  threshold) ? down_left  & 0x1FFF : l;
+    dr = bink2g_recon_near(target, down_right, threshold) ? down_right & 0x1FFF : r;
+
+    for (int x = 0; x < 8; x++) {
+        center[x] = bink2g_recon_curve(d + 4, l - d, r - d, x);
+        top[x]    = bink2g_recon_curve(u + 4, ul - u, ur - u, x) - center[x];
+        bottom[x] = bink2g_recon_curve(v + 4, dl - v, dr - v, x) - center[x];
+    }
+
+    for (int y = 0; y < FFMIN(height, 8); y++) {
+        for (int x = 0; x < FFMIN(width, 8); x++)
+            dst[x] = av_clip_uint8(bink2g_recon_curve(center[x], top[x],
+                                                      bottom[x], y) >> 3);
+        dst += stride;
+    }
+}
+
+static void bink2g_reconstruct_blocks(Bink2Context *c, uint8_t *dst,
+                                       int stride, int comp, int global_y,
+                                       const DCIPredict *up_row, int up_by,
+                                       const DCIPredict *row, int by,
+                                       const DCIPredict *down_row, int down_by)
+{
+    const int chroma = comp == 1 || comp == 2;
+    const int blocks_per_mb = chroma ? 2 : 4;
+    const int plane_w = chroma ? (c->avctx->width  + 1) >> 1 : c->avctx->width;
+    const int plane_h = chroma ? (c->avctx->height + 1) >> 1 : c->avctx->height;
+    const int visible_blocks_w = (plane_w + 7) >> 3;
+    const int coded_blocks_w = ((c->avctx->width + 31) >> 5) * blocks_per_mb;
+    const int coded_plane_h = ((c->avctx->height + 31) >> 5) *
+                              blocks_per_mb * 8;
+    const int threshold = (c->frame_flags & 0xFF) << 3;
+    const int have_up = global_y >= 8;
+    const int have_down = global_y + 8 < coded_plane_h;
+
+    for (int bx = 0; bx < visible_blocks_w; bx++) {
+        const uint16_t target = bink2g_recon_state(row, comp, blocks_per_mb,
+                                                   coded_blocks_w, bx, by);
+        const uint16_t left = bx ?
+                               bink2g_recon_state(row, comp, blocks_per_mb,
+                                                  coded_blocks_w, bx - 1, by) : target;
+        const uint16_t right = bx + 1 < coded_blocks_w ?
+                                bink2g_recon_state(row, comp, blocks_per_mb,
+                                                   coded_blocks_w, bx + 1, by) : target;
+        const uint16_t up_left = have_up && bx ?
+                                     bink2g_recon_state(up_row, comp, blocks_per_mb,
+                                                        coded_blocks_w, bx - 1, up_by) : 0;
+        const uint16_t up = have_up ?
+                             bink2g_recon_state(up_row, comp, blocks_per_mb,
+                                                coded_blocks_w, bx, up_by) : target;
+        const uint16_t up_right = have_up && bx + 1 < coded_blocks_w ?
+                                       bink2g_recon_state(up_row, comp, blocks_per_mb,
+                                                         coded_blocks_w, bx + 1, up_by) : 0;
+        const uint16_t down_left = bx ?
+                                        have_down ?
+                                            bink2g_recon_state(down_row, comp, blocks_per_mb,
+                                                               coded_blocks_w, bx - 1, down_by) :
+                                            (target & 0xE000) | (left & 0x1FFF) : 0;
+        const uint16_t down = have_down ?
+                               bink2g_recon_state(down_row, comp, blocks_per_mb,
+                                                  coded_blocks_w, bx, down_by) : target;
+        const uint16_t down_right = bx + 1 < coded_blocks_w ?
+                                         have_down ?
+                                             bink2g_recon_state(down_row, comp, blocks_per_mb,
+                                                                coded_blocks_w, bx + 1, down_by) :
+                                             (target & 0xE000) | (right & 0x1FFF) : 0;
+
+        bink2g_reconstruct_block(dst + bx * 8, stride,
+                                 plane_w - bx * 8, plane_h - global_y,
+                                 left, target, right, up_left, up, up_right,
+                                 down_left, down, down_right, threshold);
+    }
+}
+
+static void bink2g_reconstruct_row(Bink2Context *c, uint8_t *dst[4],
+                                   const int stride[4], int y,
+                                   const DCIPredict *prev_idc,
+                                   const DCIPredict *current_idc,
+                                   int is_last)
+{
+    for (int comp = 0; comp < 3 + c->has_alpha; comp++) {
+        const int chroma = comp == 1 || comp == 2;
+        const int plane = comp == 1 ? 2 : comp == 2 ? 1 : comp;
+        const int blocks_per_mb = chroma ? 2 : 4;
+        const int plane_y = chroma ? y >> 1 : y;
+
+        if (y > 0) {
+            const int by = blocks_per_mb - 1;
+
+            bink2g_reconstruct_blocks(c, dst[plane] - 8 * stride[plane],
+                                      stride[plane], comp, plane_y - 8,
+                                      prev_idc, by - 1,
+                                      prev_idc, by,
+                                      current_idc, 0);
+        }
+
+        for (int by = 0; by < blocks_per_mb - 1; by++) {
+            const DCIPredict *up_row = by ? current_idc :
+                                           y > 0 ? prev_idc : current_idc;
+            const int up_by = by ? by - 1 :
+                              y > 0 ? blocks_per_mb - 1 : 0;
+
+            bink2g_reconstruct_blocks(c, dst[plane] + by * 8 * stride[plane],
+                                      stride[plane], comp, plane_y + by * 8,
+                                      up_row, up_by,
+                                      current_idc, by,
+                                      current_idc, by + 1);
+        }
+
+        if (is_last) {
+            const int by = blocks_per_mb - 1;
+
+            bink2g_reconstruct_blocks(c, dst[plane] + by * 8 * stride[plane],
+                                      stride[plane], comp, plane_y + by * 8,
+                                      current_idc, by - 1,
+                                      current_idc, by,
+                                      current_idc, by);
+        }
+    }
+}
+
+static void bink2g_filter_vertical_row(Bink2Context *c, uint8_t *dst[4],
+                                       const int stride[4], int comp,
+                                       const DCIPredict *row,
+                                       const MVPredict *mv_row,
+                                       int by, int rel_y)
+{
+    const int chroma = comp != 0;
+    const int plane = comp == 1 ? 2 : comp == 2 ? 1 : 0;
+    const int blocks_per_mb = chroma ? 2 : 4;
+    const int plane_w = chroma ? (c->avctx->width + 1) >> 1 : c->avctx->width;
+    const int blocks_w = (plane_w + 7) >> 3;
+
+    if (c->frame_flags & 0x4000)
+        return;
+
+    for (int bx = 1; bx < blocks_w; bx++) {
+        const int mb = bx / blocks_per_mb;
+        const int local_x = bx % blocks_per_mb;
+        const int left_mb = local_x ? mb : mb - 1;
+        const int left_x = local_x ? local_x - 1 : blocks_per_mb - 1;
+        const uint16_t left_state = row[left_mb].state[comp]
+                                       [by * blocks_per_mb + left_x];
+        const uint16_t right_state = row[mb].state[comp]
+                                        [by * blocks_per_mb + local_x];
+        unsigned left = bink2g_filter_strength(left_state);
+        unsigned right = bink2g_filter_strength(right_state);
+        const int edge_x = bx * (chroma ? 16 : 8);
+
+        bink2g_select_coding_edge(left_state, right_state, &left, &right);
+
+        if (edge_x >= c->avctx->width ||
+            bink2g_filter_map_skip(c->col_cbp, edge_x))
+            continue;
+
+        if (chroma || !(bx & 1)) {
+            const int qrow = chroma ? by : by >> 1;
+            const int left_q = 2 * qrow + (local_x ? 0 : 1);
+            const int right_q = 2 * qrow + (local_x ? 1 : 0);
+
+            bink2g_force_mv_edge(&mv_row[left_mb].mv, left_q,
+                                 &mv_row[mb].mv, right_q,
+                                 left_state, right_state, &left, &right);
+        }
+
+        bink2g_filter_vertical_edge(dst[plane] + bx * 8 +
+                                   rel_y * stride[plane],
+                                   stride[plane], left, right);
+    }
+}
+
+static void bink2g_filter_horizontal_row(Bink2Context *c, uint8_t *dst[4],
+                                         const int stride[4], int comp,
+                                         const DCIPredict *top_row, int top_by,
+                                         const MVPredict *top_mv,
+                                         const DCIPredict *bottom_row, int bottom_by,
+                                         const MVPredict *bottom_mv,
+                                         int rel_y, int edge_y, int slice_start)
+{
+    const int chroma = comp != 0;
+    const int plane = comp == 1 ? 2 : comp == 2 ? 1 : 0;
+    const int blocks_per_mb = chroma ? 2 : 4;
+    const int plane_w = chroma ? (c->avctx->width + 1) >> 1 : c->avctx->width;
+    const int blocks_w = (plane_w + 7) >> 3;
+
+    if ((c->frame_flags & 0x8000) || edge_y == slice_start ||
+        edge_y >= c->avctx->height ||
+        bink2g_filter_map_skip(c->row_cbp, edge_y))
+        return;
+
+    for (int bx = 0; bx < blocks_w; bx++) {
+        const int mb = bx / blocks_per_mb;
+        const int local_x = bx % blocks_per_mb;
+        const uint16_t top_state = top_row[mb].state[comp]
+                                      [top_by * blocks_per_mb + local_x];
+        const uint16_t bottom_state = bottom_row[mb].state[comp]
+                                         [bottom_by * blocks_per_mb + local_x];
+        unsigned top = bink2g_filter_strength(top_state);
+        unsigned bottom = bink2g_filter_strength(bottom_state);
+
+        bink2g_select_coding_edge(top_state, bottom_state, &top, &bottom);
+
+        if (chroma || bottom_by == 0 || bottom_by == 2) {
+            const int qcol = chroma ? local_x : local_x >> 1;
+            const int top_q = (bottom_by ? 0 : 2) + qcol;
+            const int bottom_q = (bottom_by ? 2 : 0) + qcol;
+
+            bink2g_force_mv_edge(&top_mv[mb].mv, top_q,
+                                 &bottom_mv[mb].mv, bottom_q,
+                                 top_state, bottom_state, &top, &bottom);
+        }
+
+        bink2g_filter_horizontal_edge(dst[plane] + bx * 8 +
+                                     rel_y * stride[plane],
+                                     stride[plane], top, bottom);
+    }
+}
+
+static void bink2g_postprocess_row(Bink2Context *c, uint8_t *dst[4],
+                                   const int stride[4], int y,
+                                   int frame_end,
+                                   const DCIPredict *prev_idc,
+                                   const DCIPredict *current_idc,
+                                   const MVPredict *prev_mv,
+                                   const MVPredict *current_mv)
+{
+    const int is_last = y + 32 >= frame_end;
+
+    bink2g_reconstruct_row(c, dst, stride, y,
+                           prev_idc, current_idc, is_last);
+
+    for (int comp = 0; comp < 3; comp++) {
+        const int chroma = comp != 0;
+        const int blocks_per_mb = chroma ? 2 : 4;
+
+        if (y > 0)
+            bink2g_filter_vertical_row(c, dst, stride, comp, prev_idc,
+                                       prev_mv,
+                                       blocks_per_mb - 1, -8);
+        for (int by = 0; by < blocks_per_mb - 1; by++)
+            bink2g_filter_vertical_row(c, dst, stride, comp, current_idc,
+                                       current_mv, by, by * 8);
+        if (is_last)
+            bink2g_filter_vertical_row(c, dst, stride, comp, current_idc,
+                                       current_mv,
+                                       blocks_per_mb - 1,
+                                       (blocks_per_mb - 1) * 8);
+    }
+
+    if (y > 0) {
+        bink2g_filter_horizontal_row(c, dst, stride, 0,
+                                     prev_idc, 2, prev_mv,
+                                     prev_idc, 3, prev_mv,
+                                     -8, y - 8, 0);
+        bink2g_filter_horizontal_row(c, dst, stride, 0,
+                                     prev_idc, 3, prev_mv,
+                                     current_idc, 0, current_mv,
+                                     0, y, 0);
+        for (int comp = 1; comp <= 2; comp++) {
+            bink2g_filter_horizontal_row(c, dst, stride, comp,
+                                         prev_idc, 0, prev_mv,
+                                         prev_idc, 1, prev_mv,
+                                         -8, y - 16, 0);
+            bink2g_filter_horizontal_row(c, dst, stride, comp,
+                                         prev_idc, 1, prev_mv,
+                                         current_idc, 0, current_mv,
+                                         0, y, 0);
+        }
+    }
+
+    bink2g_filter_horizontal_row(c, dst, stride, 0,
+                                 current_idc, 0, current_mv,
+                                 current_idc, 1, current_mv,
+                                 8, y + 8, 0);
+    bink2g_filter_horizontal_row(c, dst, stride, 0,
+                                 current_idc, 1, current_mv,
+                                 current_idc, 2, current_mv,
+                                 16, y + 16, 0);
+
+    if (is_last) {
+        bink2g_filter_horizontal_row(c, dst, stride, 0,
+                                     current_idc, 2, current_mv,
+                                     current_idc, 3, current_mv,
+                                     24, y + 24, 0);
+        for (int comp = 1; comp <= 2; comp++)
+            bink2g_filter_horizontal_row(c, dst, stride, comp,
+                                         current_idc, 0, current_mv,
+                                         current_idc, 1, current_mv,
+                                         8, y + 16, 0);
+    }
+}
+
+static void bink2g_postprocess_frame(Bink2Context *c, uint8_t *dst[4],
+                                     const int stride[4])
+{
+    const int mb_width  = (c->avctx->width  + 31) >> 5;
+    const int mb_height = (c->avctx->height + 31) >> 5;
+    const int frame_end = mb_height << 5;
+
+    for (int mb_y = 0; mb_y < mb_height; mb_y++) {
+        const int y = mb_y << 5;
+        const int prev_y = mb_y ? mb_y - 1 : 0;
+        const DCIPredict *prev_idc = c->frame_idc + prev_y * mb_width;
+        const DCIPredict *current_idc = c->frame_idc + mb_y * mb_width;
+        const MVPredict *prev_mv = c->frame_mv + prev_y * mb_width;
+        const MVPredict *current_mv = c->frame_mv + mb_y * mb_width;
+        uint8_t *row_dst[4] = {
+            dst[0] + y * stride[0],
+            dst[1] + (y >> 1) * stride[1],
+            dst[2] + (y >> 1) * stride[2],
+            c->has_alpha ? dst[3] + y * stride[3] : NULL,
+        };
+
+        bink2g_postprocess_row(c, row_dst, stride, y, frame_end,
+                               prev_idc, current_idc, prev_mv, current_mv);
+    }
+}
+
 static int bink2g_decode_slice(Bink2Context *c,
                                uint8_t *dst[4], int stride[4],
                                uint8_t *src[4], int sstride[4],
@@ -1245,10 +1617,13 @@ static int bink2g_decode_slice(Bink2Context *c,
     GetBitContext *gb = &c->gb;
     int w = c->avctx->width;
     int h = c->avctx->height;
+    const int mb_width = (w + 31) / 32;
     int ret = 0, dq, flags;
 
-    memset(c->prev_q, 0, ((c->avctx->width + 31) / 32) * sizeof(*c->prev_q));
-    memset(c->prev_mv, 0, ((c->avctx->width + 31) / 32) * sizeof(*c->prev_mv));
+    memset(c->prev_q, 0, mb_width * sizeof(*c->prev_q));
+    memset(c->prev_mv, 0, mb_width * sizeof(*c->prev_mv));
+    memset(c->prev_idc, 0, mb_width * sizeof(*c->prev_idc));
+    memset(c->current_idc, 0, mb_width * sizeof(*c->current_idc));
 
     for (int y = start; y < end; y += 32) {
         int types_lru[4] = { MOTION_BLOCK, RESIDUE_BLOCK, SKIP_BLOCK, INTRA_BLOCK };
@@ -1265,6 +1640,8 @@ static int bink2g_decode_slice(Bink2Context *c,
             MVectors mv = { 0 };
 
             c->mb_pos = x / 32;
+            memset(c->current_idc[c->mb_pos].state, 0,
+                   sizeof(c->current_idc[c->mb_pos].state));
             c->current_idc[c->mb_pos].block_type = type;
             flags = 0;
             if (y == start)
@@ -1466,7 +1843,13 @@ static int bink2g_decode_slice(Bink2Context *c,
             default:
                 return AVERROR_INVALIDDATA;
             }
+
         }
+
+        memcpy(c->frame_idc + (y >> 5) * mb_width, c->current_idc,
+               mb_width * sizeof(*c->frame_idc));
+        memcpy(c->frame_mv + (y >> 5) * mb_width, c->current_mv,
+               mb_width * sizeof(*c->frame_mv));
 
         dst[0] += stride[0] * 32;
         dst[1] += stride[1] * 16;

@@ -45,108 +45,64 @@
 
 static void bink2_get_block_flags(GetBitContext *gb, int offset, int size, uint8_t *dst)
 {
-    int j, v = 0, flags_left, mode = 0, nv;
-    unsigned cache, flag = 0;
+    int flags_left, mode = 0;
+    unsigned flag = 0;
 
     if (get_bits1(gb) == 0) {
-        for (j = 0; j < size >> 3; j++)
-            dst[j] = get_bits(gb, 8);
-        dst[j] = get_bitsz(gb, size & 7);
+        for (int i = 0; i < size; i++, offset++) {
+            const unsigned value = get_bits1(gb);
+
+            dst[offset >> 3] |= value << (offset & 7);
+        }
 
         return;
     }
 
     flags_left = size;
     while (flags_left > 0) {
-        cache = offset;
         if (get_bits1(gb) == 0) {
+            int count;
+
             if (mode == 3) {
                 flag ^= 1;
             } else {
                 flag = get_bits1(gb);
+            }
+
+            dst[offset >> 3] |= flag << (offset & 7);
+            offset++;
+            flags_left--;
+
+            count = FFMIN(flags_left, 4);
+            for (int i = 0; i < count; i++, offset++, flags_left--) {
+                const unsigned value = get_bits1(gb);
+
+                dst[offset >> 3] |= value << (offset & 7);
             }
             mode = 2;
-            if (flags_left < 5) {
-                nv = get_bitsz(gb, flags_left - 1);
-                nv <<= (offset + 1) & 0x1f;
-                offset += flags_left;
-                flags_left = 0;
-            } else {
-                nv = get_bits(gb, 4) << ((offset + 1) & 0x1f);
-                offset += 5;
-                flags_left -= 5;
-            }
-            v |= flag << (cache & 0x1f) | nv;
-            if (offset >= 8) {
-                *dst++ = v & 0xff;
-                v >>= 8;
-                offset -= 8;
-            }
         } else {
-            int temp, bits, nb_coded;
+            int bits, run;
 
             bits = flags_left < 4 ? 2 : flags_left < 16 ? 4 : 5;
-            nb_coded = bits + 1;
             if (mode == 3) {
                 flag ^= 1;
+                run = bits + 1;
             } else {
-                nb_coded++;
                 flag = get_bits1(gb);
-            }
-            nb_coded = FFMIN(nb_coded, flags_left);
-            flags_left -= nb_coded;
-            if (flags_left > 0) {
-                temp = get_bits(gb, bits);
-                flags_left -= temp;
-                nb_coded += temp;
-                mode = temp == (1 << bits) - 1U ? 1 : 3;
+                run = bits + 2;
             }
 
-            temp = (flag << 0x1f) >> 0x1f & 0xff;
-            while (nb_coded > 8) {
-                v |= temp << (cache & 0x1f);
-                *dst++ = v & 0xff;
-                v >>= 8;
-                nb_coded -= 8;
+            run = FFMIN(run, flags_left);
+            if (run != flags_left) {
+                const unsigned extra = get_bits(gb, bits);
+
+                run += extra;
+                mode = extra == (1U << bits) - 1 ? 1 : 3;
             }
-            if (nb_coded > 0) {
-                offset += nb_coded;
-                v |= ((1 << (nb_coded & 0x1f)) - 1U & temp) << (cache & 0x1f);
-                if (offset >= 8) {
-                    *dst++ = v & 0xff;
-                    v >>= 8;
-                    offset -= 8;
-                }
-            }
-        }
-    }
 
-    if (offset != 0)
-        *dst = v;
-}
-
-static av_always_inline int bink2_round_q16(int value)
-{
-    return value < 0 ? -((-value + 32768) >> 16) : (value + 32768) >> 16;
-}
-
-static void bink2_convert_new_ycrcb(AVFrame *frame)
-{
-    const int chroma_width  = (frame->width  + 1) >> 1;
-    const int chroma_height = (frame->height + 1) >> 1;
-
-    for (int y = 0; y < chroma_height; y++) {
-        uint8_t *cb = frame->data[1] + y * frame->linesize[1];
-        uint8_t *cr = frame->data[2] + y * frame->linesize[2];
-
-        for (int x = 0; x < chroma_width; x++) {
-            const int raw_cb = cb[x] - 128;
-            const int raw_cr = cr[x] - 128;
-            const int out_cb = bink2_round_q16(32768 * raw_cb - 22554 * raw_cr);
-            const int out_cr = bink2_round_q16(-46802 * raw_cb + 32768 * raw_cr);
-
-            cb[x] = av_clip_uint8(128 + out_cb);
-            cr[x] = av_clip_uint8(128 + out_cr);
+            for (int i = 0; i < run; i++, offset++)
+                dst[offset >> 3] |= flag << (offset & 7);
+            flags_left -= run;
         }
     }
 }
@@ -188,7 +144,7 @@ static int bink2_decode_slice(AVCodecContext *avctx, void *arg,
     if (c->has_alpha)
         dst[3] += start * stride[3];
 
-    if (c->version <= 'f')
+    if (c->version <= 'f' || !(c->frame_flags & 0x2000))
         ret = bink2f_decode_slice(c, dst, stride, src, sstride,
                                   td->is_kf, start, end);
     else
@@ -274,6 +230,11 @@ static int bink2_decode_frame(AVCodecContext *avctx, AVFrame *frame,
 
     skip_bits_long(gb, 32 + 32 * (c->num_slices - 1));
 
+    memset(c->row_cbp, 0,
+           ((((avctx->height + 31) >> 3) + 7) >> 3) * sizeof(*c->row_cbp));
+    memset(c->col_cbp, 0,
+           ((((avctx->width + 31) >> 3) + 7) >> 3) * sizeof(*c->col_cbp));
+
     if (c->frame_flags & 0x10000) {
         if (!(c->frame_flags & 0x8000))
             bink2_get_block_flags(gb, 1, (((avctx->height + 15) & ~15) >> 3) - 1, c->row_cbp);
@@ -313,6 +274,10 @@ static int bink2_decode_frame(AVCodecContext *avctx, AVFrame *frame,
         if (thread_ret[i] < 0)
             return thread_ret[i];
 
+    if (c->version > 'f' && (c->frame_flags & 0x2000)) {
+        bink2g_postprocess_frame(c, frame->data, frame->linesize);
+    }
+
     if (is_kf)
         frame->flags |= AV_FRAME_FLAG_KEY;
     else
@@ -322,12 +287,6 @@ static int bink2_decode_frame(AVCodecContext *avctx, AVFrame *frame,
     av_frame_unref(c->last);
     if ((ret = av_frame_ref(c->last, frame)) < 0)
         return ret;
-
-    if (c->flags & BINK_FLAG_YCRCB_NEW) {
-        if ((ret = av_frame_make_writable(frame)) < 0)
-            return ret;
-        bink2_convert_new_ycrcb(frame);
-    }
 
     frame->colorspace  = avctx->colorspace;
     frame->color_range = avctx->color_range;
@@ -439,6 +398,16 @@ static av_cold int bink2_decode_init(AVCodecContext *avctx)
     if ((ret = bink2_alloc_slice_state(c, avctx->width)) < 0)
         return ret;
 
+    {
+        const size_t mb_count = (size_t)((avctx->width + 31) >> 5) *
+                                ((avctx->height + 31) >> 5);
+
+        c->frame_idc = av_malloc_array(mb_count, sizeof(*c->frame_idc));
+        c->frame_mv  = av_malloc_array(mb_count, sizeof(*c->frame_mv));
+        if (!c->frame_idc || !c->frame_mv)
+            return AVERROR(ENOMEM);
+    }
+
     c->col_cbp = av_calloc((((avctx->width + 31) >> 3) + 7) >> 3, sizeof(*c->col_cbp));
     if (!c->col_cbp)
         return AVERROR(ENOMEM);
@@ -458,6 +427,10 @@ static av_cold int bink2_decode_init(AVCodecContext *avctx)
         sc->has_alpha = c->has_alpha;
         sc->flags = c->flags;
         sc->dsp = c->dsp;
+        sc->col_cbp = c->col_cbp;
+        sc->row_cbp = c->row_cbp;
+        sc->frame_idc = c->frame_idc;
+        sc->frame_mv = c->frame_mv;
         if ((ret = bink2_alloc_slice_state(sc, avctx->width)) < 0)
             return ret;
     }
@@ -484,6 +457,8 @@ static av_cold int bink2_decode_end(AVCodecContext *avctx)
         }
     }
     bink2_free_slice_state(c);
+    av_freep(&c->frame_idc);
+    av_freep(&c->frame_mv);
     av_freep(&c->col_cbp);
     av_freep(&c->row_cbp);
 

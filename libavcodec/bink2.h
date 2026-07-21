@@ -75,6 +75,7 @@ typedef struct DCPredict {
 
 typedef struct DCIPredict {
     int dc[4][16];
+    uint16_t state[4][16];
     int block_type;
 } DCIPredict;
 
@@ -112,6 +113,13 @@ typedef struct Bink2Context {
 
     MVPredict       *current_mv;
     MVPredict       *prev_mv;
+
+    /* Modern Bink2 reconstruction and filtering need the neighbouring rows
+     * even when those rows belong to different bitstream slices.  Slice jobs
+     * write disjoint rows here; the parent context post-processes the complete
+     * frame after every slice has finished. */
+    DCIPredict      *frame_idc;
+    MVPredict       *frame_mv;
 
     uint8_t         *col_cbp;
     uint8_t         *row_cbp;
